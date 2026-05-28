@@ -1,0 +1,224 @@
+name: Build Universal ImageMagick for macOS
+
+# Trigger manually from GitHub Actions tab → Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  # ── Build on Apple Silicon (ARM64) ────────────────────────────────────────
+  build-arm64:
+    runs-on: macos-latest   # M-series Mac, ARM64
+    steps:
+      - name: Install ImageMagick
+        run: brew install imagemagick
+
+      - name: Collect files
+        run: |
+          IM=$(brew --prefix imagemagick)
+          PREFIX=$(brew --prefix)
+          mkdir -p out/bin \
+                   out/lib/ImageMagick/modules-Q16HDRI/coders \
+                   out/lib/ImageMagick/modules-Q16HDRI/filters \
+                   out/lib/ImageMagick/config-Q16HDRI \
+                   out/etc/ImageMagick-7 \
+                   out/share/ImageMagick-7
+
+          cp "$IM/bin/magick" out/bin/
+
+          # Versioned dylibs only (not the text stubs)
+          cp "$IM/lib/libMagickCore-7.Q16HDRI.10.dylib"  out/lib/ || true
+          cp "$IM/lib/libMagickWand-7.Q16HDRI.10.dylib"  out/lib/ || true
+          cp "$IM/lib/libMagick++-7.Q16HDRI.5.dylib"     out/lib/ || true
+
+          # Codec plugins (.so files)
+          cp "$IM/lib/ImageMagick/modules-Q16HDRI/coders/"*.so  out/lib/ImageMagick/modules-Q16HDRI/coders/
+          cp "$IM/lib/ImageMagick/modules-Q16HDRI/filters/"*.so out/lib/ImageMagick/modules-Q16HDRI/filters/ 2>/dev/null || true
+
+          # Runtime config
+          cp "$IM/lib/ImageMagick/config-Q16HDRI/configure.xml" out/lib/ImageMagick/config-Q16HDRI/ || true
+          cp "$IM/etc/ImageMagick-7/"*.xml out/etc/ImageMagick-7/
+          cp "$PREFIX/share/ImageMagick-7/english.xml" out/share/ImageMagick-7/ || true
+          cp "$PREFIX/share/ImageMagick-7/locale.xml"  out/share/ImageMagick-7/ || true
+
+          # Record the dylib version numbers used (may differ between ARM/Intel)
+          otool -L out/bin/magick | grep -E 'libMagick' > out/dylib-versions.txt
+          cat out/dylib-versions.txt
+
+          tar -czf imagemagick-arm64.tar.gz out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imagemagick-arm64
+          path: imagemagick-arm64.tar.gz
+
+  # ── Build on Intel (x86_64) ───────────────────────────────────────────────
+  build-x86_64:
+    runs-on: macos-13       # last Intel GitHub runner
+    steps:
+      - name: Install ImageMagick
+        run: brew install imagemagick
+
+      - name: Collect files
+        run: |
+          IM=$(brew --prefix imagemagick)
+          PREFIX=$(brew --prefix)
+          mkdir -p out/bin \
+                   out/lib/ImageMagick/modules-Q16HDRI/coders \
+                   out/lib/ImageMagick/modules-Q16HDRI/filters \
+                   out/lib/ImageMagick/config-Q16HDRI \
+                   out/etc/ImageMagick-7 \
+                   out/share/ImageMagick-7
+
+          cp "$IM/bin/magick" out/bin/
+
+          cp "$IM/lib/libMagickCore-7.Q16HDRI.10.dylib"  out/lib/ || true
+          cp "$IM/lib/libMagickWand-7.Q16HDRI.10.dylib"  out/lib/ || true
+          cp "$IM/lib/libMagick++-7.Q16HDRI.5.dylib"     out/lib/ || true
+
+          cp "$IM/lib/ImageMagick/modules-Q16HDRI/coders/"*.so  out/lib/ImageMagick/modules-Q16HDRI/coders/
+          cp "$IM/lib/ImageMagick/modules-Q16HDRI/filters/"*.so out/lib/ImageMagick/modules-Q16HDRI/filters/ 2>/dev/null || true
+
+          cp "$IM/lib/ImageMagick/config-Q16HDRI/configure.xml" out/lib/ImageMagick/config-Q16HDRI/ || true
+          cp "$IM/etc/ImageMagick-7/"*.xml out/etc/ImageMagick-7/
+          cp "$PREFIX/share/ImageMagick-7/english.xml" out/share/ImageMagick-7/ || true
+          cp "$PREFIX/share/ImageMagick-7/locale.xml"  out/share/ImageMagick-7/ || true
+
+          otool -L out/bin/magick | grep -E 'libMagick' > out/dylib-versions.txt
+          cat out/dylib-versions.txt
+
+          tar -czf imagemagick-x86_64.tar.gz out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imagemagick-x86_64
+          path: imagemagick-x86_64.tar.gz
+
+  # ── Combine into universal binary ─────────────────────────────────────────
+  combine:
+    needs: [build-arm64, build-x86_64]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: imagemagick-arm64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: imagemagick-x86_64
+
+      - name: Extract
+        run: |
+          mkdir -p arm x86
+          tar -xzf imagemagick-arm64.tar.gz  -C arm
+          tar -xzf imagemagick-x86_64.tar.gz -C x86
+          echo "=== ARM dylib refs ===" && cat arm/out/dylib-versions.txt
+          echo "=== Intel dylib refs ===" && cat x86/out/dylib-versions.txt
+
+      - name: Combine with lipo
+        run: |
+          mkdir -p universal/bin \
+                   universal/lib/ImageMagick/modules-Q16HDRI/coders \
+                   universal/lib/ImageMagick/modules-Q16HDRI/filters \
+                   universal/lib/ImageMagick/config-Q16HDRI \
+                   universal/etc/ImageMagick-7 \
+                   universal/share/ImageMagick-7
+
+          # magick binary
+          lipo -create arm/out/bin/magick x86/out/bin/magick \
+               -output universal/bin/magick
+          lipo -info universal/bin/magick
+
+          # Main dylibs
+          for lib in \
+            libMagickCore-7.Q16HDRI.10.dylib \
+            libMagickWand-7.Q16HDRI.10.dylib \
+            libMagick++-7.Q16HDRI.5.dylib; do
+            if [ -f "arm/out/lib/$lib" ] && [ -f "x86/out/lib/$lib" ]; then
+              lipo -create "arm/out/lib/$lib" "x86/out/lib/$lib" \
+                   -output "universal/lib/$lib"
+              echo "Combined $lib"
+            fi
+          done
+
+          # Codec .so plugins (combine where both arches have the file)
+          for f in arm/out/lib/ImageMagick/modules-Q16HDRI/coders/*.so; do
+            name=$(basename "$f")
+            x86file="x86/out/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+            if [ -f "$x86file" ]; then
+              lipo -create "$f" "$x86file" \
+                   -output "universal/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+            else
+              echo "WARNING: no x86 version of $name, copying ARM only"
+              cp "$f" "universal/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+            fi
+          done
+
+          # Filter .so plugins
+          for f in arm/out/lib/ImageMagick/modules-Q16HDRI/filters/*.so; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            x86file="x86/out/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+            if [ -f "$x86file" ]; then
+              lipo -create "$f" "$x86file" \
+                   -output "universal/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+            else
+              cp "$f" "universal/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+            fi
+          done
+
+          # Config files — same content on both; use ARM version
+          cp arm/out/lib/ImageMagick/config-Q16HDRI/configure.xml \
+             universal/lib/ImageMagick/config-Q16HDRI/ 2>/dev/null || true
+          cp arm/out/etc/ImageMagick-7/*.xml universal/etc/ImageMagick-7/
+          cp arm/out/share/ImageMagick-7/*.xml universal/share/ImageMagick-7/ 2>/dev/null || true
+
+      - name: Fix dylib load paths (remove Homebrew prefix dependency)
+        run: |
+          MAGICK=universal/bin/magick
+          LIBDIR=universal/lib
+
+          for lib in \
+            libMagickCore-7.Q16HDRI.10.dylib \
+            libMagickWand-7.Q16HDRI.10.dylib \
+            libMagick++-7.Q16HDRI.5.dylib; do
+
+            # Fix install name in the dylib itself
+            install_name_tool -id "@loader_path/$lib" "$LIBDIR/$lib"
+
+            # Fix what magick references (ARM prefix /opt/homebrew and Intel /usr/local)
+            for prefix in /opt/homebrew /usr/local; do
+              install_name_tool -change "$prefix/lib/$lib" \
+                "@loader_path/../lib/$lib" "$MAGICK" 2>/dev/null || true
+            done
+          done
+
+          # Fix inter-dylib references (libMagickWand + libMagick++ reference libMagickCore)
+          for dep_lib in \
+            libMagickCore-7.Q16HDRI.10.dylib \
+            libMagickWand-7.Q16HDRI.10.dylib; do
+            for consumer in \
+              "$LIBDIR/libMagickWand-7.Q16HDRI.10.dylib" \
+              "$LIBDIR/libMagick++-7.Q16HDRI.5.dylib"; do
+              for prefix in /opt/homebrew /usr/local; do
+                install_name_tool -change "$prefix/lib/$dep_lib" \
+                  "@loader_path/$dep_lib" "$consumer" 2>/dev/null || true
+              done
+            done
+          done
+
+          echo "=== Final load commands for magick ==="
+          otool -L "$MAGICK"
+
+          echo "=== Final load commands for libMagickCore ==="
+          otool -L "$LIBDIR/libMagickCore-7.Q16HDRI.10.dylib"
+
+      - name: Package final artifact
+        run: |
+          tar -czf imagemagick-universal-macos.tar.gz universal/
+          ls -lh imagemagick-universal-macos.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imagemagick-universal-macos
+          path: imagemagick-universal-macos.tar.gz
+          retention-days: 30
