@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOSv2
+name: Build Universal ImageMagick for macOSv3
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
@@ -173,33 +173,68 @@ jobs:
           CODERS="$LIBDIR/ImageMagick/modules-Q16HDRI/coders"
           FILTERS="$LIBDIR/ImageMagick/modules-Q16HDRI/filters"
 
+          # lipo output from Homebrew bottles can be read-only (-r--r--r--).
+          # install_name_tool needs write permission and may otherwise exit 1
+          # without a useful GitHub Actions log line.
+          chmod -R u+w uni
+
+          change_dep() {
+            local target="$1"
+            local old="$2"
+            local new="$3"
+            local label="$4"
+
+            if install_name_tool -change "$old" "$new" "$target"; then
+              echo "$label changed: $old -> $new"
+              return 0
+            fi
+
+            # Fat binaries can expose both arm64 and x86_64 original paths.
+            # If a prior install_name_tool call already removed this exact old
+            # path from all slices, do not fail the build on a stale queued item.
+            if ! otool -L "$target" | awk 'NR>1{print $1}' | grep -Fxq "$old"; then
+              echo "$label already changed or absent: $old"
+              return 0
+            fi
+
+            echo "ERROR: install_name_tool failed for $target" >&2
+            echo "  old: $old" >&2
+            echo "  new: $new" >&2
+            echo "  current load paths:" >&2
+            otool -L "$target" >&2 || true
+            return 1
+          }
+
           # 1. magick binary → bundled dylibs: @loader_path/../lib/<name>
-          otool -L "$MAGICK" | awk 'NR>1{print $1}' \
-            | grep -E '^(/opt/homebrew|/usr/local)' \
-            | grep -v '^/usr/lib' \
-            | while IFS= read -r recorded; do
-              name=$(basename "$recorded")
-              [ -f "$LIBDIR/$name" ] || continue
-              install_name_tool -change "$recorded" "@loader_path/../lib/$name" "$MAGICK"
-              echo "magick changed: $recorded -> @loader_path/../lib/$name"
-            done
+          deps=$(mktemp)
+          otool -L "$MAGICK" | awk 'NR>1{print $1}'             | grep -E '^(/opt/homebrew|/usr/local)'             | grep -v '^/usr/lib' > "$deps" || true
+
+          while IFS= read -r recorded; do
+            [ -n "$recorded" ] || continue
+            name=$(basename "$recorded")
+            [ -f "$LIBDIR/$name" ] || continue
+            change_dep "$MAGICK" "$recorded" "@loader_path/../lib/$name" "magick"
+          done < "$deps"
+          rm -f "$deps"
 
           # 2. Each bundled dylib: set its own install name + fix deps to siblings.
           for lib in "$LIBDIR"/*.dylib; do
             [ -f "$lib" ] || continue
             name=$(basename "$lib")
+            echo "Patching dylib: $name"
             install_name_tool -id "@loader_path/$name" "$lib"
 
-            otool -L "$lib" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local)' \
-              | grep -v '^/usr/lib' \
-              | while IFS= read -r recorded; do
-                dname=$(basename "$recorded")
-                [ "$dname" = "$name" ] && continue
-                [ -f "$LIBDIR/$dname" ] || continue
-                install_name_tool -change "$recorded" "@loader_path/$dname" "$lib"
-                echo "$name changed: $recorded -> @loader_path/$dname"
-              done
+            deps=$(mktemp)
+            otool -L "$lib" | awk 'NR>1{print $1}'               | grep -E '^(/opt/homebrew|/usr/local)'               | grep -v '^/usr/lib' > "$deps" || true
+
+            while IFS= read -r recorded; do
+              [ -n "$recorded" ] || continue
+              dname=$(basename "$recorded")
+              [ "$dname" = "$name" ] && continue
+              [ -f "$LIBDIR/$dname" ] || continue
+              change_dep "$lib" "$recorded" "@loader_path/$dname" "$name"
+            done < "$deps"
+            rm -f "$deps"
           done
 
           # 3. .so modules → bundled dylibs: @executable_path/../lib/<name>
@@ -207,16 +242,18 @@ jobs:
           for so in "$CODERS"/*.so "$FILTERS"/*.so; do
             [ -f "$so" ] || continue
             so_name=$(basename "$so")
+            echo "Patching module: $so_name"
 
-            otool -L "$so" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local)' \
-              | grep -v '^/usr/lib' \
-              | while IFS= read -r recorded; do
-                dname=$(basename "$recorded")
-                [ -f "$LIBDIR/$dname" ] || continue
-                install_name_tool -change "$recorded" "@executable_path/../lib/$dname" "$so"
-                echo "$so_name changed: $recorded -> @executable_path/../lib/$dname"
-              done
+            deps=$(mktemp)
+            otool -L "$so" | awk 'NR>1{print $1}'               | grep -E '^(/opt/homebrew|/usr/local)'               | grep -v '^/usr/lib' > "$deps" || true
+
+            while IFS= read -r recorded; do
+              [ -n "$recorded" ] || continue
+              dname=$(basename "$recorded")
+              [ -f "$LIBDIR/$dname" ] || continue
+              change_dep "$so" "$recorded" "@executable_path/../lib/$dname" "$so_name"
+            done < "$deps"
+            rm -f "$deps"
           done
 
       - name: Verify universal binaries and load paths
