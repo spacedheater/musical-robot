@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOS1
+name: Build Universal ImageMagick for macOS2
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
@@ -43,6 +43,20 @@ jobs:
           chmod +x uni/bin/magick
           echo "magick: $(lipo -archs uni/bin/magick)"
 
+          # ── libMagick*.dylib (Homebrew records Cellar paths in binaries, not opt/) ─
+          for arm_lib in "$ARM/lib/"libMagick*.dylib; do
+            [ "$(stat -f%z "$arm_lib")" -lt 100 ] && continue
+            name=$(basename "$arm_lib")
+            x86_lib="$X86/lib/$name"
+            if [ -f "$x86_lib" ] && [ "$(stat -f%z "$x86_lib")" -gt 100 ]; then
+              lipo -create "$arm_lib" "$x86_lib" -output "uni/lib/$name"
+              echo "universal: $name"
+            else
+              cp "$arm_lib" "uni/lib/$name"
+              echo "arm64-only: $name"
+            fi
+          done
+
           # ── .so plugins (merge arm64+x86 or copy arm64 if no x86 match) ──
           for arm_so in "$ARM/lib/ImageMagick/modules-Q16HDRI/coders/"*.so; do
             name=$(basename "$arm_so")
@@ -85,10 +99,11 @@ jobs:
               while IFS= read -r recorded; do
                 name=$(basename "$recorded")
                 [ -f "uni/lib/$name" ] && continue   # already collected
-                # Locate arm64 and x86_64 copies of this dep
-                arm_path="${recorded/\/usr\/local\/opt//opt/homebrew/opt}"
-                x86_path="${recorded/\/opt\/homebrew\/opt//usr/local/opt}"
-                if [ -f "$arm_path" ] && [ -f "$x86_path" ]; then
+                # Translate between ARM (/opt/homebrew/) and Intel (/usr/local/) prefixes.
+                # Works for both opt/ and Cellar/ sub-paths.
+                arm_path="${recorded/\/usr\/local\//\/opt\/homebrew\/}"
+                x86_path="${recorded/\/opt\/homebrew\//\/usr\/local\/}"
+                if [ -f "$arm_path" ] && [ -f "$x86_path" ] && [ "$arm_path" != "$x86_path" ]; then
                   lipo -create "$arm_path" "$x86_path" -output "uni/lib/$name"
                   echo "  universal dep: $name"
                   found=1
@@ -102,7 +117,7 @@ jobs:
                   found=1
                 fi
               done < <(otool -L "$src" | awk 'NR>1{print $1}' \
-                       | grep -E '^(/opt/homebrew/opt|/usr/local/opt)')
+                       | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib')
             done
             [ "$found" -eq 0 ] && break
           done
@@ -120,7 +135,7 @@ jobs:
           # 1. magick binary → ALL bundled dylibs: @loader_path/../lib/<name>
           #    (@loader_path for the binary = bin/, so ../lib/ lands in lib/)
           otool -L "$MAGICK" | awk 'NR>1{print $1}' \
-            | grep -E '^(/opt/homebrew|/usr/local/opt)' \
+            | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib' \
             | while read recorded; do
               name=$(basename "$recorded")
               [ -f "$LIBDIR/$name" ] || continue
@@ -133,7 +148,7 @@ jobs:
             name=$(basename "$lib")
             install_name_tool -id "@loader_path/$name" "$lib"
             otool -L "$lib" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local/opt)' \
+              | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib' \
               | while read recorded; do
                 dname=$(basename "$recorded")
                 [ "$dname" = "$name" ] && continue   # skip self-reference
@@ -149,7 +164,7 @@ jobs:
                     "$LIBDIR"/ImageMagick/modules-Q16HDRI/filters/*.so; do
             [ -f "$so" ] || continue
             otool -L "$so" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local/opt)' \
+              | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib' \
               | while read recorded; do
                 dname=$(basename "$recorded")
                 [ -f "$LIBDIR/$dname" ] || continue
@@ -163,9 +178,11 @@ jobs:
           otool -L "$MAGICK"
           echo ""
           echo "=== Checking for remaining Homebrew absolute paths ==="
-          if otool -L "$MAGICK" | grep -qE '^[[:space:]]/opt/homebrew|^[[:space:]]/usr/local/opt'; then
+          if otool -L "$MAGICK" | awk 'NR>1{print $1}' \
+               | grep -E '^(/opt/homebrew|/usr/local)' | grep -qv '^/usr/lib'; then
             echo "FAIL: machine-specific paths still present:"
-            otool -L "$MAGICK" | grep -E '/opt/homebrew|/usr/local/opt'
+            otool -L "$MAGICK" | awk 'NR>1{print $1}' \
+              | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib'
             exit 1
           fi
           echo "OK: no machine-specific paths"
