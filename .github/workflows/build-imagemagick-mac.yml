@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOSv3
+name: Build Universal ImageMagick for macOSv4
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
@@ -103,6 +103,30 @@ jobs:
           done
 
           cp "$ARM/etc/ImageMagick-7/"*.xml uni/etc/ImageMagick-7/
+
+          # Copy ImageMagick lib-side configuration files too.
+          # Homebrew keeps module/config metadata under lib/ImageMagick* as well
+          # as etc/ImageMagick-7. Without these files, the binary can start but
+          # fail to resolve coder modules such as xc.so during real work.
+          echo "--- Copying ImageMagick lib-side config metadata ---"
+          while IFS= read -r cfg; do
+            rel="${cfg#"$ARM/lib/"}"
+            mkdir -p "uni/lib/$(dirname "$rel")"
+            cp "$cfg" "uni/lib/$rel"
+            echo "  config: $rel"
+          done < <(find "$ARM/lib" -path "$ARM/lib/ImageMagick*" -type f ! -name '*.so' -print)
+
+          # Compatibility module-layout symlinks. Depending on MAGICK_HOME and
+          # the embedded configure path, ImageMagick may look under a versioned
+          # lib/ImageMagick-* directory even when MAGICK_CODER_MODULE_PATH is set.
+          IM_VERSION=$("$ARM/bin/magick" --version | awk '/^Version:/{print $3; exit}')
+          IM_SHORT_VERSION="${IM_VERSION%-*}"
+          for imdir in "ImageMagick-7" "ImageMagick-$IM_SHORT_VERSION" "ImageMagick-$IM_VERSION"; do
+            mkdir -p "uni/lib/$imdir"
+            rm -rf "uni/lib/$imdir/modules-Q16HDRI"
+            ln -s "../ImageMagick/modules-Q16HDRI" "uni/lib/$imdir/modules-Q16HDRI"
+            echo "  module alias: uni/lib/$imdir/modules-Q16HDRI -> ../ImageMagick/modules-Q16HDRI"
+          done
 
           # ── Collect ALL Homebrew dylibs transitively ─────────────────────
           # Scan magick + every bundled dylib/module for non-system Homebrew deps,
@@ -325,13 +349,28 @@ jobs:
           set -euo pipefail
 
           export MAGICK_HOME="$(pwd)/uni"
-          export MAGICK_CONFIGURE_PATH="$(pwd)/uni/etc/ImageMagick-7"
-          export MAGICK_CODER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/coders"
-          export MAGICK_FILTER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/filters"
+
+          CONFIG_PATHS="$(pwd)/uni/etc/ImageMagick-7"
+          for d in "$(pwd)"/uni/lib/ImageMagick*/config-Q16HDRI; do
+            [ -d "$d" ] || continue
+            CONFIG_PATHS="$CONFIG_PATHS:$d"
+          done
+          export MAGICK_CONFIGURE_PATH="$CONFIG_PATHS"
+
+          MODULE_ROOT="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI"
+          export MAGICK_CODER_MODULE_PATH="$MODULE_ROOT/coders"
+          export MAGICK_FILTER_MODULE_PATH="$MODULE_ROOT/filters"
 
           # Intentionally do not set DYLD_LIBRARY_PATH. The patched install names
           # should make the package self-contained.
           uni/bin/magick --version
+          echo ""
+          echo "MAGICK_CONFIGURE_PATH=$MAGICK_CONFIGURE_PATH"
+          echo "MAGICK_CODER_MODULE_PATH=$MAGICK_CODER_MODULE_PATH"
+          uni/bin/magick -list format | grep -E '^[[:space:]]*XC[[:space:]]' || {
+            echo "ERROR: XC coder is not registered; module/config paths are wrong" >&2
+            exit 1
+          }
           echo ""
 
           uni/bin/magick -size 200x200 xc:white \
@@ -347,11 +386,26 @@ jobs:
           set -euo pipefail
 
           export MAGICK_HOME="$(pwd)/uni"
-          export MAGICK_CONFIGURE_PATH="$(pwd)/uni/etc/ImageMagick-7"
-          export MAGICK_CODER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/coders"
-          export MAGICK_FILTER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/filters"
+
+          CONFIG_PATHS="$(pwd)/uni/etc/ImageMagick-7"
+          for d in "$(pwd)"/uni/lib/ImageMagick*/config-Q16HDRI; do
+            [ -d "$d" ] || continue
+            CONFIG_PATHS="$CONFIG_PATHS:$d"
+          done
+          export MAGICK_CONFIGURE_PATH="$CONFIG_PATHS"
+
+          MODULE_ROOT="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI"
+          export MAGICK_CODER_MODULE_PATH="$MODULE_ROOT/coders"
+          export MAGICK_FILTER_MODULE_PATH="$MODULE_ROOT/filters"
 
           arch -x86_64 uni/bin/magick --version
+          echo ""
+          echo "MAGICK_CONFIGURE_PATH=$MAGICK_CONFIGURE_PATH"
+          echo "MAGICK_CODER_MODULE_PATH=$MAGICK_CODER_MODULE_PATH"
+          arch -x86_64 uni/bin/magick -list format | grep -E '^[[:space:]]*XC[[:space:]]' || {
+            echo "ERROR: XC coder is not registered under Rosetta; module/config paths are wrong" >&2
+            exit 1
+          }
           echo ""
 
           arch -x86_64 uni/bin/magick -size 200x200 xc:white \
