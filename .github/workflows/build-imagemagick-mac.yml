@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOS3
+name: Build Universal ImageMagick for macOSv2
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
@@ -122,9 +122,17 @@ jobs:
                 [ -f "uni/lib/$name" ] && continue
 
                 # Translate between ARM (/opt/homebrew/) and Intel (/usr/local/) prefixes.
-                # This handles both opt/ and Cellar/ sub-paths.
-                arm_path="${recorded/\/usr\/local\//\/opt\/homebrew\/}"
-                x86_path="${recorded/\/opt\/homebrew\//\/usr\/local\/}"
+                # Use prefix stripping instead of Bash replacement with escaped slashes;
+                # the prior form produced literal \/opt\/homebrew paths on macOS bash.
+                if [[ "$recorded" == /usr/local/* ]]; then
+                  arm_path="/opt/homebrew/${recorded#/usr/local/}"
+                  x86_path="$recorded"
+                elif [[ "$recorded" == /opt/homebrew/* ]]; then
+                  arm_path="$recorded"
+                  x86_path="/usr/local/${recorded#/opt/homebrew/}"
+                else
+                  continue
+                fi
 
                 if [ -f "$arm_path" ] && [ -f "$x86_path" ] && [ "$arm_path" != "$x86_path" ]; then
                   lipo -create "$arm_path" "$x86_path" -output "uni/lib/$name"
