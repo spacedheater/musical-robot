@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOSv4
+name: Build Universal ImageMagick for macOSv5
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
@@ -7,7 +7,7 @@ on:
 jobs:
   build-universal:
     # arm64 runner — builds arm64 natively, x86_64 via Rosetta (no Intel runner needed)
-    runs-on: macos-latest
+    runs-on: macos-15-arm64
 
     steps:
       - name: Install arm64 ImageMagick (native Homebrew)
@@ -104,21 +104,12 @@ jobs:
 
           cp "$ARM/etc/ImageMagick-7/"*.xml uni/etc/ImageMagick-7/
 
-          # Copy ImageMagick lib-side configuration files too.
-          # Homebrew keeps module/config metadata under lib/ImageMagick* as well
-          # as etc/ImageMagick-7. Without these files, the binary can start but
-          # fail to resolve coder modules such as xc.so during real work.
-          echo "--- Copying ImageMagick lib-side config metadata ---"
-          while IFS= read -r cfg; do
-            rel="${cfg#"$ARM/lib/"}"
-            mkdir -p "uni/lib/$(dirname "$rel")"
-            cp "$cfg" "uni/lib/$rel"
-            echo "  config: $rel"
-          done < <(find "$ARM/lib" -path "$ARM/lib/ImageMagick*" -type f ! -name '*.so' -print)
-
-          # Compatibility module-layout symlinks. Depending on MAGICK_HOME and
-          # the embedded configure path, ImageMagick may look under a versioned
-          # lib/ImageMagick-* directory even when MAGICK_CODER_MODULE_PATH is set.
+          # Do not copy Homebrew .la module metadata.
+          # Those files contain absolute Cellar libdir values and can make a
+          # supposedly portable package load modules from /opt/homebrew or
+          # /usr/local on the build machine. We rely on the .so modules plus
+          # MAGICK_CODER_MODULE_PATH / MAGICK_FILTER_MODULE_PATH instead.
+          echo "--- Creating compatibility module-layout symlinks ---"
           IM_VERSION=$("$ARM/bin/magick" --version | awk '/^Version:/{print $3; exit}')
           IM_SHORT_VERSION="${IM_VERSION%-*}"
           for imdir in "ImageMagick-7" "ImageMagick-$IM_SHORT_VERSION" "ImageMagick-$IM_VERSION"; do
@@ -320,6 +311,23 @@ jobs:
           done
 
           [ "$bad" -eq 0 ] || exit 1
+
+          echo ""
+          echo "=== Checking portable metadata ==="
+          if find uni -type f -name '*.la' | grep -q .; then
+            echo "FAIL: .la module metadata should not be packaged because it contains build-machine paths" >&2
+            find uni -type f -name '*.la' >&2
+            exit 1
+          fi
+
+          text_leftovers=$(find uni -type f \( -name '*.xml' -o -name '*.la' -o -name '*.pc' -o -name '*.txt' \) -print0 |
+            xargs -0 grep -nE '/opt/homebrew|/usr/local' 2>/dev/null || true)
+          if [ -n "$text_leftovers" ]; then
+            echo "FAIL: text metadata still contains machine-specific Homebrew paths:" >&2
+            echo "$text_leftovers" >&2
+            exit 1
+          fi
+
           echo "OK: no machine-specific Homebrew paths anywhere"
 
       - name: Ad-hoc sign all Mach-O files
@@ -349,15 +357,10 @@ jobs:
           set -euo pipefail
 
           export MAGICK_HOME="$(pwd)/uni"
-
-          CONFIG_PATHS="$(pwd)/uni/etc/ImageMagick-7"
-          for d in "$(pwd)"/uni/lib/ImageMagick*/config-Q16HDRI; do
-            [ -d "$d" ] || continue
-            CONFIG_PATHS="$CONFIG_PATHS:$d"
-          done
-          export MAGICK_CONFIGURE_PATH="$CONFIG_PATHS"
+          export MAGICK_CONFIGURE_PATH="$(pwd)/uni/etc/ImageMagick-7"
 
           MODULE_ROOT="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI"
+          export MAGICK_MODULE_PATH="$MODULE_ROOT"
           export MAGICK_CODER_MODULE_PATH="$MODULE_ROOT/coders"
           export MAGICK_FILTER_MODULE_PATH="$MODULE_ROOT/filters"
 
@@ -365,20 +368,42 @@ jobs:
           # should make the package self-contained.
           uni/bin/magick --version
           echo ""
+          echo "MAGICK_HOME=$MAGICK_HOME"
           echo "MAGICK_CONFIGURE_PATH=$MAGICK_CONFIGURE_PATH"
           echo "MAGICK_CODER_MODULE_PATH=$MAGICK_CODER_MODULE_PATH"
-          uni/bin/magick -list format | grep -E '^[[:space:]]*XC[[:space:]]' || {
-            echo "ERROR: XC coder is not registered; module/config paths are wrong" >&2
+          echo ""
+
+          uni/bin/magick -list module | tee /tmp/im_modules_arm64.txt
+          test -s /tmp/im_modules_arm64.txt || {
+            echo "ERROR: ImageMagick did not list any modules" >&2
             exit 1
           }
-          echo ""
+
+          uni/bin/magick -list format | tee /tmp/im_formats_arm64.txt >/dev/null
+          for fmt in XC PNG JPEG TIFF WEBP; do
+            grep -E "^[[:space:]]*$fmt\\*?[[:space:]]" /tmp/im_formats_arm64.txt || {
+              echo "ERROR: expected format $fmt is not registered" >&2
+              echo "Nearby format lines:" >&2
+              grep -Ei "^[[:space:]]*($fmt|JPG|JPE|TIF|WEBP|XC)" /tmp/im_formats_arm64.txt >&2 || true
+              exit 1
+            }
+          done
 
           uni/bin/magick -size 200x200 xc:white \
             -stroke red -strokewidth 3 -fill none \
             -draw "rectangle 20,20 180,180" \
-            -quality 88 /tmp/critiqly_smoke_arm64.jpg
+            /tmp/critiqly_smoke_arm64.png
 
-          file /tmp/critiqly_smoke_arm64.jpg
+          uni/bin/magick /tmp/critiqly_smoke_arm64.png -quality 88 /tmp/critiqly_smoke_arm64.jpg
+          uni/bin/magick /tmp/critiqly_smoke_arm64.png /tmp/critiqly_smoke_arm64.tiff
+          uni/bin/magick /tmp/critiqly_smoke_arm64.png /tmp/critiqly_smoke_arm64.webp
+
+          for out in /tmp/critiqly_smoke_arm64.png /tmp/critiqly_smoke_arm64.jpg /tmp/critiqly_smoke_arm64.tiff /tmp/critiqly_smoke_arm64.webp; do
+            test -s "$out" || { echo "ERROR: missing output $out" >&2; exit 1; }
+            file "$out"
+            uni/bin/magick identify "$out"
+          done
+
           echo "Smoke test arm64: PASSED"
 
       - name: Smoke test x86_64 under Rosetta
@@ -386,34 +411,51 @@ jobs:
           set -euo pipefail
 
           export MAGICK_HOME="$(pwd)/uni"
-
-          CONFIG_PATHS="$(pwd)/uni/etc/ImageMagick-7"
-          for d in "$(pwd)"/uni/lib/ImageMagick*/config-Q16HDRI; do
-            [ -d "$d" ] || continue
-            CONFIG_PATHS="$CONFIG_PATHS:$d"
-          done
-          export MAGICK_CONFIGURE_PATH="$CONFIG_PATHS"
+          export MAGICK_CONFIGURE_PATH="$(pwd)/uni/etc/ImageMagick-7"
 
           MODULE_ROOT="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI"
+          export MAGICK_MODULE_PATH="$MODULE_ROOT"
           export MAGICK_CODER_MODULE_PATH="$MODULE_ROOT/coders"
           export MAGICK_FILTER_MODULE_PATH="$MODULE_ROOT/filters"
 
           arch -x86_64 uni/bin/magick --version
           echo ""
+          echo "MAGICK_HOME=$MAGICK_HOME"
           echo "MAGICK_CONFIGURE_PATH=$MAGICK_CONFIGURE_PATH"
           echo "MAGICK_CODER_MODULE_PATH=$MAGICK_CODER_MODULE_PATH"
-          arch -x86_64 uni/bin/magick -list format | grep -E '^[[:space:]]*XC[[:space:]]' || {
-            echo "ERROR: XC coder is not registered under Rosetta; module/config paths are wrong" >&2
+          echo ""
+
+          arch -x86_64 uni/bin/magick -list module | tee /tmp/im_modules_x86_64.txt
+          test -s /tmp/im_modules_x86_64.txt || {
+            echo "ERROR: ImageMagick did not list any modules under Rosetta" >&2
             exit 1
           }
-          echo ""
+
+          arch -x86_64 uni/bin/magick -list format | tee /tmp/im_formats_x86_64.txt >/dev/null
+          for fmt in XC PNG JPEG TIFF WEBP; do
+            grep -E "^[[:space:]]*$fmt\\*?[[:space:]]" /tmp/im_formats_x86_64.txt || {
+              echo "ERROR: expected format $fmt is not registered under Rosetta" >&2
+              echo "Nearby format lines:" >&2
+              grep -Ei "^[[:space:]]*($fmt|JPG|JPE|TIF|WEBP|XC)" /tmp/im_formats_x86_64.txt >&2 || true
+              exit 1
+            }
+          done
 
           arch -x86_64 uni/bin/magick -size 200x200 xc:white \
             -stroke red -strokewidth 3 -fill none \
             -draw "rectangle 20,20 180,180" \
-            -quality 88 /tmp/critiqly_smoke_x86_64.jpg
+            /tmp/critiqly_smoke_x86_64.png
 
-          file /tmp/critiqly_smoke_x86_64.jpg
+          arch -x86_64 uni/bin/magick /tmp/critiqly_smoke_x86_64.png -quality 88 /tmp/critiqly_smoke_x86_64.jpg
+          arch -x86_64 uni/bin/magick /tmp/critiqly_smoke_x86_64.png /tmp/critiqly_smoke_x86_64.tiff
+          arch -x86_64 uni/bin/magick /tmp/critiqly_smoke_x86_64.png /tmp/critiqly_smoke_x86_64.webp
+
+          for out in /tmp/critiqly_smoke_x86_64.png /tmp/critiqly_smoke_x86_64.jpg /tmp/critiqly_smoke_x86_64.tiff /tmp/critiqly_smoke_x86_64.webp; do
+            test -s "$out" || { echo "ERROR: missing output $out" >&2; exit 1; }
+            file "$out"
+            arch -x86_64 uni/bin/magick identify "$out"
+          done
+
           echo "Smoke test x86_64: PASSED"
 
       - name: Package
