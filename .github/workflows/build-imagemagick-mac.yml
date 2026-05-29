@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOS2
+name: Build Universal ImageMagick for macOS3
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
@@ -11,20 +11,27 @@ jobs:
 
     steps:
       - name: Install arm64 ImageMagick (native Homebrew)
-        run: brew install imagemagick
+        run: |
+          set -euo pipefail
+          brew install imagemagick
 
       - name: Install x86_64 ImageMagick (Intel Homebrew via Rosetta)
         run: |
+          set -euo pipefail
+
           # Intel Homebrew lives at /usr/local; arm64 Homebrew is at /opt/homebrew
           if [ ! -f /usr/local/bin/brew ]; then
             arch -x86_64 /bin/bash -c \
               "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
               < /dev/null
           fi
+
           arch -x86_64 /usr/local/bin/brew install imagemagick
 
       - name: Collect and merge with lipo
         run: |
+          set -euo pipefail
+
           ARM=$(brew --prefix imagemagick)
           X86=$(/usr/local/bin/brew --prefix imagemagick)
 
@@ -33,6 +40,7 @@ jobs:
           file "$ARM/bin/magick"
           file "$X86/bin/magick"
 
+          rm -rf uni
           mkdir -p uni/bin \
                    uni/lib/ImageMagick/modules-Q16HDRI/coders \
                    uni/lib/ImageMagick/modules-Q16HDRI/filters \
@@ -43,29 +51,39 @@ jobs:
           chmod +x uni/bin/magick
           echo "magick: $(lipo -archs uni/bin/magick)"
 
-          # ── libMagick*.dylib (Homebrew records Cellar paths in binaries, not opt/) ─
+          # ── libMagick*.dylib ─────────────────────────────────────────────
+          # Homebrew records these as Cellar paths in binaries, not always opt/ paths,
+          # so collect them explicitly from each architecture's ImageMagick prefix.
           for arm_lib in "$ARM/lib/"libMagick*.dylib; do
+            [ -f "$arm_lib" ] || continue
             [ "$(stat -f%z "$arm_lib")" -lt 100 ] && continue
+
             name=$(basename "$arm_lib")
             x86_lib="$X86/lib/$name"
+
             if [ -f "$x86_lib" ] && [ "$(stat -f%z "$x86_lib")" -gt 100 ]; then
               lipo -create "$arm_lib" "$x86_lib" -output "uni/lib/$name"
-              echo "universal: $name"
+              echo "universal ImageMagick dylib: $name"
             else
-              cp "$arm_lib" "uni/lib/$name"
-              echo "arm64-only: $name"
+              echo "ERROR: missing x86_64 match for $name at $x86_lib" >&2
+              exit 1
             fi
           done
 
-          # ── .so plugins (merge arm64+x86 or copy arm64 if no x86 match) ──
+          # ── .so plugins ──────────────────────────────────────────────────
+          # For a universal package, missing x86_64 modules should fail loudly.
           for arm_so in "$ARM/lib/ImageMagick/modules-Q16HDRI/coders/"*.so; do
+            [ -f "$arm_so" ] || continue
             name=$(basename "$arm_so")
             x86_so="$X86/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+
             if [ -f "$x86_so" ]; then
               lipo -create "$arm_so" "$x86_so" \
-                   -output "uni/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+                -output "uni/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+              echo "universal coder: $name"
             else
-              cp "$arm_so" "uni/lib/ImageMagick/modules-Q16HDRI/coders/$name"
+              echo "ERROR: missing x86_64 coder module $name at $x86_so" >&2
+              exit 1
             fi
           done
 
@@ -73,149 +91,236 @@ jobs:
             [ -f "$arm_so" ] || continue
             name=$(basename "$arm_so")
             x86_so="$X86/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+
             if [ -f "$x86_so" ]; then
               lipo -create "$arm_so" "$x86_so" \
-                   -output "uni/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+                -output "uni/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+              echo "universal filter: $name"
             else
-              cp "$arm_so" "uni/lib/ImageMagick/modules-Q16HDRI/filters/$name"
+              echo "ERROR: missing x86_64 filter module $name at $x86_so" >&2
+              exit 1
             fi
           done
 
           cp "$ARM/etc/ImageMagick-7/"*.xml uni/etc/ImageMagick-7/
 
           # ── Collect ALL Homebrew dylibs transitively ─────────────────────
-          # Scan magick + every .so for non-system (/opt/homebrew or /usr/local/opt)
-          # dependencies, copy the arm64 + x86_64 versions, lipo-merge them.
-          # Repeat until no new deps are discovered (handles transitive deps).
+          # Scan magick + every bundled dylib/module for non-system Homebrew deps,
+          # lipo-merge arm64+x86_64 copies into uni/lib, and repeat until stable.
           echo "--- Collecting transitive Homebrew dylibs ---"
           while true; do
             found=0
+
             for src in uni/bin/magick \
+                       uni/lib/*.dylib \
                        uni/lib/ImageMagick/modules-Q16HDRI/coders/*.so \
-                       uni/lib/ImageMagick/modules-Q16HDRI/filters/*.so \
-                       uni/lib/*.dylib; do
+                       uni/lib/ImageMagick/modules-Q16HDRI/filters/*.so; do
               [ -f "$src" ] || continue
-              # Read from the arm64 slice (same dep names for both arches)
+
               while IFS= read -r recorded; do
                 name=$(basename "$recorded")
-                [ -f "uni/lib/$name" ] && continue   # already collected
+                [ -f "uni/lib/$name" ] && continue
+
                 # Translate between ARM (/opt/homebrew/) and Intel (/usr/local/) prefixes.
-                # Works for both opt/ and Cellar/ sub-paths.
+                # This handles both opt/ and Cellar/ sub-paths.
                 arm_path="${recorded/\/usr\/local\//\/opt\/homebrew\/}"
                 x86_path="${recorded/\/opt\/homebrew\//\/usr\/local\/}"
+
                 if [ -f "$arm_path" ] && [ -f "$x86_path" ] && [ "$arm_path" != "$x86_path" ]; then
                   lipo -create "$arm_path" "$x86_path" -output "uni/lib/$name"
                   echo "  universal dep: $name"
                   found=1
                 elif [ -f "$arm_path" ]; then
-                  cp "$arm_path" "uni/lib/$name"
-                  echo "  arm64-only dep: $name"
-                  found=1
+                  echo "ERROR: missing x86_64 dependency for $name" >&2
+                  echo "  recorded: $recorded" >&2
+                  echo "  arm_path: $arm_path" >&2
+                  echo "  x86_path: $x86_path" >&2
+                  exit 1
                 elif [ -f "$x86_path" ]; then
-                  cp "$x86_path" "uni/lib/$name"
-                  echo "  x86_64-only dep: $name"
-                  found=1
+                  echo "ERROR: missing arm64 dependency for $name" >&2
+                  echo "  recorded: $recorded" >&2
+                  echo "  arm_path: $arm_path" >&2
+                  echo "  x86_path: $x86_path" >&2
+                  exit 1
+                else
+                  echo "WARN: dependency path was recorded but neither translated path exists: $recorded" >&2
                 fi
               done < <(otool -L "$src" | awk 'NR>1{print $1}' \
-                       | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib')
+                       | grep -E '^(/opt/homebrew|/usr/local)' \
+                       | grep -v '^/usr/lib' || true)
             done
+
             [ "$found" -eq 0 ] && break
           done
+
           echo "--- Dylib collection complete ---"
-          ls uni/lib/*.dylib
+          ls -lh uni/lib/*.dylib
 
       - name: Fix dylib load paths
         run: |
+          set -euo pipefail
+
           MAGICK=uni/bin/magick
           LIBDIR=uni/lib
+          CODERS="$LIBDIR/ImageMagick/modules-Q16HDRI/coders"
+          FILTERS="$LIBDIR/ImageMagick/modules-Q16HDRI/filters"
 
-          # Fix ALL non-system Homebrew paths — not just libMagick*.
-          # Uses otool to read the actual recorded paths rather than guessing prefixes.
-
-          # 1. magick binary → ALL bundled dylibs: @loader_path/../lib/<name>
-          #    (@loader_path for the binary = bin/, so ../lib/ lands in lib/)
+          # 1. magick binary → bundled dylibs: @loader_path/../lib/<name>
           otool -L "$MAGICK" | awk 'NR>1{print $1}' \
-            | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib' \
-            | while read recorded; do
+            | grep -E '^(/opt/homebrew|/usr/local)' \
+            | grep -v '^/usr/lib' \
+            | while IFS= read -r recorded; do
               name=$(basename "$recorded")
               [ -f "$LIBDIR/$name" ] || continue
               install_name_tool -change "$recorded" "@loader_path/../lib/$name" "$MAGICK"
-              echo "magick: $name"
+              echo "magick changed: $recorded -> @loader_path/../lib/$name"
             done
 
-          # 2. Each bundled dylib: set its own install name + fix deps to siblings
+          # 2. Each bundled dylib: set its own install name + fix deps to siblings.
           for lib in "$LIBDIR"/*.dylib; do
+            [ -f "$lib" ] || continue
             name=$(basename "$lib")
             install_name_tool -id "@loader_path/$name" "$lib"
+
             otool -L "$lib" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib' \
-              | while read recorded; do
+              | grep -E '^(/opt/homebrew|/usr/local)' \
+              | grep -v '^/usr/lib' \
+              | while IFS= read -r recorded; do
                 dname=$(basename "$recorded")
-                [ "$dname" = "$name" ] && continue   # skip self-reference
+                [ "$dname" = "$name" ] && continue
                 [ -f "$LIBDIR/$dname" ] || continue
                 install_name_tool -change "$recorded" "@loader_path/$dname" "$lib"
+                echo "$name changed: $recorded -> @loader_path/$dname"
               done
           done
 
           # 3. .so modules → bundled dylibs: @executable_path/../lib/<name>
-          #    magick executable is at bin/; @executable_path = bin/ at runtime,
-          #    so @executable_path/../lib/ resolves to lib/ regardless of .so location.
-          for so in "$LIBDIR"/ImageMagick/modules-Q16HDRI/coders/*.so \
-                    "$LIBDIR"/ImageMagick/modules-Q16HDRI/filters/*.so; do
+          # At runtime, @executable_path is uni/bin, so ../lib resolves to uni/lib.
+          for so in "$CODERS"/*.so "$FILTERS"/*.so; do
             [ -f "$so" ] || continue
+            so_name=$(basename "$so")
+
             otool -L "$so" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib' \
-              | while read recorded; do
+              | grep -E '^(/opt/homebrew|/usr/local)' \
+              | grep -v '^/usr/lib' \
+              | while IFS= read -r recorded; do
                 dname=$(basename "$recorded")
                 [ -f "$LIBDIR/$dname" ] || continue
                 install_name_tool -change "$recorded" "@executable_path/../lib/$dname" "$so"
+                echo "$so_name changed: $recorded -> @executable_path/../lib/$dname"
               done
           done
 
-          # ── Verify ─────────────────────────────────────────────────────────
+      - name: Verify universal binaries and load paths
+        run: |
+          set -euo pipefail
+
+          echo "=== Verify every bundled Mach-O is universal ==="
+          for f in uni/bin/magick \
+                   uni/lib/*.dylib \
+                   uni/lib/ImageMagick/modules-Q16HDRI/coders/*.so \
+                   uni/lib/ImageMagick/modules-Q16HDRI/filters/*.so; do
+            [ -f "$f" ] || continue
+            archs=$(lipo -archs "$f" 2>/dev/null || true)
+            echo "$f: $archs"
+            echo "$archs" | grep -q 'arm64' || { echo "FAIL: $f missing arm64" >&2; exit 1; }
+            echo "$archs" | grep -q 'x86_64' || { echo "FAIL: $f missing x86_64" >&2; exit 1; }
+          done
+
           echo ""
           echo "=== Final load commands for magick ==="
-          otool -L "$MAGICK"
-          echo ""
-          echo "=== Checking for remaining Homebrew absolute paths ==="
-          if otool -L "$MAGICK" | awk 'NR>1{print $1}' \
-               | grep -E '^(/opt/homebrew|/usr/local)' | grep -qv '^/usr/lib'; then
-            echo "FAIL: machine-specific paths still present:"
-            otool -L "$MAGICK" | awk 'NR>1{print $1}' \
-              | grep -E '^(/opt/homebrew|/usr/local)' | grep -v '^/usr/lib'
-            exit 1
-          fi
-          echo "OK: no machine-specific paths"
+          otool -L uni/bin/magick
 
-      - name: Ad-hoc sign
-        # Gives the binary a local code identity so Gatekeeper's first-run check
-        # passes without needing an Apple Developer certificate.
+          echo ""
+          echo "=== Checking for remaining Homebrew absolute paths everywhere ==="
+          bad=0
+          for f in uni/bin/magick \
+                   uni/lib/*.dylib \
+                   uni/lib/ImageMagick/modules-Q16HDRI/coders/*.so \
+                   uni/lib/ImageMagick/modules-Q16HDRI/filters/*.so; do
+            [ -f "$f" ] || continue
+            leftovers=$(otool -L "$f" | awk 'NR>1{print $1}' \
+              | grep -E '^(/opt/homebrew|/usr/local)' \
+              | grep -v '^/usr/lib' || true)
+
+            if [ -n "$leftovers" ]; then
+              echo "FAIL: machine-specific paths still present in $f:"
+              echo "$leftovers"
+              bad=1
+            fi
+          done
+
+          [ "$bad" -eq 0 ] || exit 1
+          echo "OK: no machine-specific Homebrew paths anywhere"
+
+      - name: Ad-hoc sign all Mach-O files
+        # install_name_tool invalidates existing signatures. Sign every binary,
+        # dylib, and ImageMagick module after all Mach-O edits are complete.
         run: |
-          codesign --sign - --force uni/bin/magick
+          set -euo pipefail
+
+          find uni -type f \( -name 'magick' -o -name '*.dylib' -o -name '*.so' \) -print0 |
+            while IFS= read -r -d '' f; do
+              echo "Signing $f"
+              codesign --force --sign - "$f"
+            done
+
+          echo ""
+          echo "=== Verify signatures ==="
+          find uni -type f \( -name 'magick' -o -name '*.dylib' -o -name '*.so' \) -print0 |
+            while IFS= read -r -d '' f; do
+              codesign --verify --verbose=2 "$f"
+            done
+
+          echo ""
           codesign -dv uni/bin/magick 2>&1 | head -4
 
-      - name: Smoke test
+      - name: Smoke test arm64
         run: |
-          export MAGICK_HOME=$(pwd)/uni
-          export DYLD_LIBRARY_PATH=$(pwd)/uni/lib
-          export MAGICK_CONFIGURE_PATH=$(pwd)/uni/etc/ImageMagick-7
-          export MAGICK_CODER_MODULE_PATH=$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/coders
-          export MAGICK_FILTER_MODULE_PATH=$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/filters
+          set -euo pipefail
 
+          export MAGICK_HOME="$(pwd)/uni"
+          export MAGICK_CONFIGURE_PATH="$(pwd)/uni/etc/ImageMagick-7"
+          export MAGICK_CODER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/coders"
+          export MAGICK_FILTER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/filters"
+
+          # Intentionally do not set DYLD_LIBRARY_PATH. The patched install names
+          # should make the package self-contained.
           uni/bin/magick --version
           echo ""
 
-          # Draw a rectangle on a JPEG to confirm codec + drawing pipeline works
           uni/bin/magick -size 200x200 xc:white \
             -stroke red -strokewidth 3 -fill none \
             -draw "rectangle 20,20 180,180" \
-            -quality 88 /tmp/critiqly_smoke.jpg
+            -quality 88 /tmp/critiqly_smoke_arm64.jpg
 
-          file /tmp/critiqly_smoke.jpg
-          echo "Smoke test: PASSED"
+          file /tmp/critiqly_smoke_arm64.jpg
+          echo "Smoke test arm64: PASSED"
+
+      - name: Smoke test x86_64 under Rosetta
+        run: |
+          set -euo pipefail
+
+          export MAGICK_HOME="$(pwd)/uni"
+          export MAGICK_CONFIGURE_PATH="$(pwd)/uni/etc/ImageMagick-7"
+          export MAGICK_CODER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/coders"
+          export MAGICK_FILTER_MODULE_PATH="$(pwd)/uni/lib/ImageMagick/modules-Q16HDRI/filters"
+
+          arch -x86_64 uni/bin/magick --version
+          echo ""
+
+          arch -x86_64 uni/bin/magick -size 200x200 xc:white \
+            -stroke red -strokewidth 3 -fill none \
+            -draw "rectangle 20,20 180,180" \
+            -quality 88 /tmp/critiqly_smoke_x86_64.jpg
+
+          file /tmp/critiqly_smoke_x86_64.jpg
+          echo "Smoke test x86_64: PASSED"
 
       - name: Package
         run: |
+          set -euo pipefail
+
           # Extracts directly into bin/mac/ in the plugin:
           #   tar -xzf imagemagick-universal-macos.tar.gz -C Critiqly.lrplugin/bin/mac/
           tar -czf imagemagick-universal-macos.tar.gz -C uni .
