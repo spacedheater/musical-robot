@@ -7,7 +7,7 @@ on:
 jobs:
   build-universal:
     # arm64 runner — builds arm64 natively, x86_64 via Rosetta (no Intel runner needed)
-    runs-on: macos-15-arm64
+    runs-on: macos-15
 
     steps:
       - name: Install arm64 ImageMagick (native Homebrew)
