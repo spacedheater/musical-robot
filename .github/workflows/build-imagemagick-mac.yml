@@ -1,4 +1,4 @@
-name: Build Universal ImageMagick for macOSv5
+name: Build Universal ImageMagick for macOSv6
 
 # Trigger manually: Actions tab → Build Universal ImageMagick for macOS → Run workflow
 on:
